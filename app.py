@@ -1,6 +1,8 @@
 import json
 import os
 import sqlite3
+import smtplib
+from email.message import EmailMessage
 from datetime import datetime, timezone
 from typing import Any, Literal
 
@@ -33,6 +35,9 @@ class IntakeRequest(BaseModel):
     type: Literal["Repair", "Vehicle sale"]
     data: dict[str, Any]
     recommendations: list[Recommendation] = Field(default_factory=list)
+
+class ChatIntakeComplete(BaseModel):
+    data: dict[str, Any]
 
 def connect() -> sqlite3.Connection:
     db = sqlite3.connect(DB_PATH)
@@ -112,6 +117,84 @@ def create_intake(body: IntakeRequest) -> dict[str, Any]:
         intake_id = cur.lastrowid
 
     return {"id": intake_id, "created_at": created_at, "type": body.type}
+
+def send_confirmation_email(data: dict[str, Any]) -> bool:
+    host = os.getenv("SMTP_HOST")
+    port = int(os.getenv("SMTP_PORT", "587"))
+    username = os.getenv("SMTP_USERNAME")
+    password = os.getenv("SMTP_PASSWORD")
+    sender = os.getenv("SMTP_FROM")
+    customer_email = str(data.get("email", "")).strip()
+
+    if not all([host, username, password, sender, customer_email]):
+        return False
+
+    msg = EmailMessage()
+    msg["Subject"] = "First Rowe Auto — diagnostic intake received"
+    msg["From"] = sender
+    msg["To"] = customer_email
+    msg.set_content(
+        f"""Hi {str(data.get("name", "")).strip() or "there"},
+
+We received your diagnostic intake for {str(data.get("vehicle", "")).strip() or "your vehicle"}.
+
+We’ll review the details and follow up with an estimate shortly.
+
+First Rowe Auto Repairs & Sales
+5821 Rodman St, Hollywood, FL 33023
+954-374-8384
+"""
+    )
+
+    with smtplib.SMTP(host, port, timeout=15) as smtp:
+        smtp.starttls()
+        smtp.login(username, password)
+        smtp.send_message(msg)
+    return True
+
+@app.post("/api/intake-chat/complete", status_code=201)
+def complete_chat_intake(body: ChatIntakeComplete) -> dict[str, Any]:
+    d = body.data
+    require(d, ["name", "phone", "email", "vehicle", "mileage", "concern"])
+
+    created_at = datetime.now(timezone.utc).isoformat()
+    payload = {"type": "Repair chat", "data": d}
+
+    with connect() as db:
+        cur = db.execute(
+            """INSERT INTO intakes
+            (intake_type, created_at, customer_name, phone, email, vehicle_year,
+             vehicle_make, vehicle_model, mileage, vin, customer_decision, payload_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                "Repair chat",
+                created_at,
+                str(d.get("name", "")).strip(),
+                str(d.get("phone", "")).strip(),
+                str(d.get("email", "")).strip(),
+                None,
+                None,
+                str(d.get("vehicle", "")).strip() or None,
+                str(d.get("mileage", "")).strip() or None,
+                str(d.get("vin", "")).strip().upper() or None,
+                None,
+                json.dumps(payload, separators=(",", ":")),
+            ),
+        )
+        intake_id = cur.lastrowid
+
+    email_sent = False
+    try:
+        email_sent = send_confirmation_email(d)
+    except Exception:
+        email_sent = False
+
+    return {
+        "id": intake_id,
+        "created_at": created_at,
+        "type": "Repair chat",
+        "email_sent": email_sent,
+    }
 
 @app.get("/api/intakes")
 def list_intakes(limit: int = 50) -> dict[str, Any]:
