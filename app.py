@@ -63,6 +63,16 @@ def init_db() -> None:
                 payload_json TEXT NOT NULL
             )
         """)
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS intake_updates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                intake_id INTEGER NOT NULL,
+                title TEXT NOT NULL,
+                detail TEXT,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (intake_id) REFERENCES intakes(id)
+            )
+        """)
 
 @app.on_event("startup")
 def startup() -> None:
@@ -118,7 +128,22 @@ def create_intake(body: IntakeRequest) -> dict[str, Any]:
 
     return {"id": intake_id, "created_at": created_at, "type": body.type}
 
-def send_confirmation_email(data: dict[str, Any]) -> bool:
+def confirmation_number(intake_id: int) -> str:
+    return f"FRA-{intake_id:06d}"
+
+def parse_confirmation_number(value: str) -> int:
+    normalized = value.strip().upper()
+    if not normalized.startswith("FRA-"):
+        raise HTTPException(404, detail="Confirmation number not found")
+    try:
+        intake_id = int(normalized[4:])
+    except ValueError:
+        raise HTTPException(404, detail="Confirmation number not found")
+    if intake_id < 1:
+        raise HTTPException(404, detail="Confirmation number not found")
+    return intake_id
+
+def send_confirmation_email(data: dict[str, Any], confirmation: str) -> bool:
     host = os.getenv("SMTP_HOST")
     port = int(os.getenv("SMTP_PORT", "587"))
     username = os.getenv("SMTP_USERNAME")
@@ -137,6 +162,10 @@ def send_confirmation_email(data: dict[str, Any]) -> bool:
         f"""Hi {str(data.get("name", "")).strip() or "there"},
 
 We received your diagnostic intake for {str(data.get("vehicle", "")).strip() or "your vehicle"}.
+
+Confirmation #: {confirmation}
+
+Use this confirmation number on the First Rowe Auto home page to check for updates.
 
 We’ll review the details and follow up with an estimate shortly.
 
@@ -182,10 +211,21 @@ def complete_chat_intake(body: ChatIntakeComplete) -> dict[str, Any]:
             ),
         )
         intake_id = cur.lastrowid
+        db.execute(
+            """INSERT INTO intake_updates (intake_id, title, detail, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (
+                intake_id,
+                "Intake received",
+                "We received your diagnostic details and will review them before preparing the estimate.",
+                created_at,
+            ),
+        )
 
+    confirmation = confirmation_number(intake_id)
     email_sent = False
     try:
-        email_sent = send_confirmation_email(d)
+        email_sent = send_confirmation_email(d, confirmation)
     except Exception:
         email_sent = False
 
@@ -194,6 +234,39 @@ def complete_chat_intake(body: ChatIntakeComplete) -> dict[str, Any]:
         "created_at": created_at,
         "type": "Repair chat",
         "email_sent": email_sent,
+        "confirmation_number": confirmation,
+    }
+
+@app.get("/api/status/{confirmation}")
+def get_intake_status(confirmation: str) -> dict[str, Any]:
+    intake_id = parse_confirmation_number(confirmation)
+
+    with connect() as db:
+        intake = db.execute(
+            "SELECT id, payload_json FROM intakes WHERE id = ?",
+            (intake_id,),
+        ).fetchone()
+        if not intake:
+            raise HTTPException(404, detail="Confirmation number not found")
+
+        updates = db.execute(
+            """SELECT title, detail, created_at
+               FROM intake_updates
+               WHERE intake_id = ?
+               ORDER BY id ASC""",
+            (intake_id,),
+        ).fetchall()
+
+    payload = json.loads(intake["payload_json"])
+    data = payload.get("data", {})
+    items = [dict(row) for row in updates]
+    current_status = items[-1]["title"] if items else "Intake received"
+
+    return {
+        "confirmation_number": confirmation_number(intake_id),
+        "vehicle": str(data.get("vehicle", "")).strip() or None,
+        "current_status": current_status,
+        "updates": items,
     }
 
 @app.get("/api/intakes")
